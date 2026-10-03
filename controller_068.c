@@ -1,0 +1,212 @@
+/*
+ * controller_068.c - RemoteOps Controller
+ * IE3090 Network Programming - IT24100068
+ *
+ * usage: ./controller_068 [agent_ip] [port]
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#define AGENT_PORT   9410
+#define SID_TAG      "SID:8600"
+
+#define BUF_SIZE     65536
+#define MAX_INPUT    1024
+#define SHOW_PROCS   30
+
+typedef struct {
+    int    fd;
+    char   buf[BUF_SIZE];
+    size_t buf_len;
+} conn_t;
+
+static int send_all(int fd, const void *data, size_t len)
+{
+    const char *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p   += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int read_line(conn_t *c, char *out, size_t out_size)
+{
+    for (;;) {
+        char *nl = memchr(c->buf, '\n', c->buf_len);
+        if (nl) {
+            size_t line_len = (size_t)(nl - c->buf);
+            size_t copy = line_len < out_size - 1 ? line_len : out_size - 1;
+            memcpy(out, c->buf, copy);
+            out[copy] = '\0';
+
+            size_t used = line_len + 1;
+            memmove(c->buf, c->buf + used, c->buf_len - used);
+            c->buf_len -= used;
+            return 1;
+        }
+        if (c->buf_len >= BUF_SIZE) {
+            c->buf_len = 0;
+            return -2;
+        }
+        ssize_t n = recv(c->fd, c->buf + c->buf_len, BUF_SIZE - c->buf_len, 0);
+        if (n == 0) return 0;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        c->buf_len += (size_t)n;
+    }
+}
+
+static int connect_to_agent(const char *host, int port)
+{
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%d", port);
+
+    struct addrinfo hints, *res;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    int rc = getaddrinfo(host, port_str, &hints, &res);
+    if (rc != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rc));
+        return -1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { perror("socket"); freeaddrinfo(res); return -1; }
+
+    if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+        perror("connect");
+        close(fd);
+        freeaddrinfo(res);
+        return -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+static void show_sysinfo(const char *line)
+{
+    double load;
+    long mem, up;
+    if (sscanf(line, "OK SYSINFO %lf %ld %ld", &load, &mem, &up) == 3) {
+        printf("   CPU load (1 min): %.2f | Memory used: %ld MB | Uptime: %ldd %02ld:%02ld:%02ld\n",
+               load, mem, up / 86400, (up % 86400) / 3600, (up % 3600) / 60, up % 60);
+    }
+}
+
+static void show_procs(char *line)
+{
+    char *list = line + strlen("OK PROCS ");
+    char *sid = strstr(list, " " SID_TAG);
+    if (sid) *sid = '\0';
+
+    int count = 1;
+    for (char *p = list; *p; p++)
+        if (*p == ',') count++;
+    printf("<< OK PROCS [%d entries] %s\n", count, SID_TAG);
+
+    int col = 0;
+    char *save = NULL;
+    for (char *e = strtok_r(list, ",", &save); e && col < SHOW_PROCS;
+         e = strtok_r(NULL, ",", &save)) {
+        char *colon = strchr(e, ':');
+        if (colon) {
+            *colon = '\0';
+            printf("   %7s %-20.20s", e, colon + 1);
+        } else {
+            printf("   %-28.28s", e);
+        }
+        if (++col % 3 == 0) printf("\n");
+    }
+    if (col % 3) printf("\n");
+    if (count > SHOW_PROCS)
+        printf("   ... %d more (full list received; showing first %d)\n",
+               count - SHOW_PROCS, SHOW_PROCS);
+}
+
+static void print_response(char *line)
+{
+    size_t len = strlen(line);
+    size_t tag = strlen(" " SID_TAG);
+    int has_sid = len >= tag && strcmp(line + len - tag, " " SID_TAG) == 0;
+
+    if (strncmp(line, "OK PROCS ", 9) == 0) {
+        show_procs(line);
+    } else {
+        printf("<< %s\n", line);
+        if (strncmp(line, "OK SYSINFO ", 11) == 0) show_sysinfo(line);
+    }
+    if (!has_sid)
+        printf("!! warning: response is missing the %s tag\n", SID_TAG);
+}
+
+int main(int argc, char *argv[])
+{
+    const char *host = argc > 1 ? argv[1] : "127.0.0.1";
+    int port = argc > 2 ? atoi(argv[2]) : AGENT_PORT;
+
+    signal(SIGPIPE, SIG_IGN);
+
+    conn_t *c = calloc(1, sizeof *c);
+    if (!c) return 1;
+
+    c->fd = connect_to_agent(host, port);
+    if (c->fd < 0) { free(c); return 1; }
+
+    printf("Connected to RemoteOps Agent at %s:%d\n", host, port);
+    printf("Commands: AUTH <token> | SYSINFO | LISTPROC | EXEC <name> | QUIT\n");
+
+    char input[MAX_INPUT];
+    static char reply[BUF_SIZE];
+
+    for (;;) {
+        printf("remoteops> ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof input, stdin)) {
+            printf("\n");
+            strcpy(input, "QUIT");
+        }
+        input[strcspn(input, "\r\n")] = '\0';
+        if (input[0] == '\0') continue;
+
+        char out[MAX_INPUT + 2];
+        int n = snprintf(out, sizeof out, "%s\n", input);
+        if (send_all(c->fd, out, (size_t)n) < 0) {
+            perror("send");
+            break;
+        }
+
+        int r = read_line(c, reply, sizeof reply);
+        if (r == 0) { printf("Agent closed the connection.\n"); break; }
+        if (r < 0)  { printf("Connection error.\n"); break; }
+
+        print_response(reply);
+
+        if (strcmp(input, "QUIT") == 0 && strncmp(reply, "OK BYE", 6) == 0)
+            break;
+    }
+
+    close(c->fd);
+    free(c);
+    return 0;
+}
