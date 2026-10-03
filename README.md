@@ -16,30 +16,60 @@
 
 ## Build (CentOS / any Linux with gcc)
 
-    make -f Makefile_068
-    make -f Makefile_068 clean
+```bash
+make -f Makefile_068          # builds agent_068 and controller_068
+make -f Makefile_068 clean
+```
 
 ## Run
 
-    ./agent_068                   # listens on TCP 9410
-    ss -tlnp | grep 9410          # verify the listening port
+```bash
+./agent_068                   # listens on TCP 9410
+ss -tlnp | grep 9410          # verify the listening port
+```
 
-Quick manual test (until the Controller is ready):
+In a second terminal:
 
-    nc localhost 9410
-    AUTH OPS-0068
-    QUIT
+```bash
+./controller_068              # connects to 127.0.0.1:9410
+./controller_068 <agent_ip>   # or another machine
+```
+
+Example session:
+
+```
+remoteops> AUTH OPS-0068
+<< OK AUTHENTICATED SID:8600
+remoteops> SYSINFO
+<< OK SYSINFO 0.33 1499 7228 SID:8600
+remoteops> EXEC HOSTNAME
+<< OK EXEC_RESULT desktop-qrr84pe SID:8600
+remoteops> QUIT
+<< OK BYE SID:8600
+```
+
+## EXEC whitelist
+
+| Name | Fixed command run by the Agent |
+|---|---|
+| DATE | `date` |
+| UPTIME | `uptime -p` |
+| DISKFREE | `df -h /` |
+| HOSTNAME | `uname -n` |
+| WHOAMI | `whoami` |
+
+The Controller only sends a name; the command string is fixed in the Agent, so user text never reaches the shell. Multi-line output is joined with ` | ` to keep one line per response.
 
 ## Status
 
 - [x] TCP listener on port 9410, thread-per-client concurrency
-- [x] Line framing (partial lines, multiple lines per recv())
+- [x] Line framing (partial lines, multiple lines per `recv()`)
 - [x] AUTH gate, QUIT, SID tag on every response
 - [x] Timestamped, thread-safe logging; ungraceful disconnect handling
-- [ ] SYSINFO, LISTPROC, EXEC
+- [x] SYSINFO (/proc), LISTPROC (ps), EXEC (fixed whitelist)
 - [ ] PUT / GET
 - [ ] MONITOR START / STOP (UDP)
-- [ ] Controller
+- [x] Controller (interactive, same framing, SID check)
 - [ ] Optional extension: transfer throughput
 
 ## Error codes
