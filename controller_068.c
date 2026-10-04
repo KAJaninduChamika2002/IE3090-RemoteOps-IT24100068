@@ -11,10 +11,15 @@
 #include <errno.h>
 #include <signal.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <time.h>
+#include <libgen.h>
+#include <sys/stat.h>
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #define AGENT_PORT   9410
@@ -23,6 +28,8 @@
 #define BUF_SIZE     65536
 #define MAX_INPUT    1024
 #define SHOW_PROCS   30
+#define CHUNK        65536
+#define DOWNLOAD_DIR "downloads"
 
 typedef struct {
     int    fd;
@@ -100,6 +107,9 @@ static int connect_to_agent(const char *host, int port)
         return -1;
     }
     freeaddrinfo(res);
+
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     return fd;
 }
 
@@ -159,6 +169,128 @@ static void print_response(char *line)
         printf("!! warning: response is missing the %s tag\n", SID_TAG);
 }
 
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static ssize_t read_bytes(conn_t *c, char *dst, size_t want)
+{
+    if (c->buf_len > 0) {
+        size_t n = c->buf_len < want ? c->buf_len : want;
+        memcpy(dst, c->buf, n);
+        memmove(c->buf, c->buf + n, c->buf_len - n);
+        c->buf_len -= n;
+        return (ssize_t)n;
+    }
+    for (;;) {
+        ssize_t n = recv(c->fd, dst, want, 0);
+        if (n < 0 && errno == EINTR) continue;
+        return n;
+    }
+}
+
+static void show_rate(const char *what, long long bytes, double secs)
+{
+    double rate = secs > 0 ? bytes / secs : 0.0;
+    printf("   %s %lld bytes in %.3f s = %.0f bytes/s (%.2f MB/s)\n",
+           what, bytes, secs, rate, rate / (1024 * 1024));
+}
+
+/* returns -1 if the connection is broken */
+static int do_put(conn_t *c, const char *local_path, char *reply, size_t reply_size)
+{
+    int fd = open(local_path, O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        printf("!! cannot open local file '%s'\n", local_path);
+        if (fd >= 0) close(fd);
+        return 0;
+    }
+
+    char path_copy[512];
+    snprintf(path_copy, sizeof path_copy, "%s", local_path);
+    const char *name = basename(path_copy);
+    long long size = st.st_size;
+
+    char header[600];
+    int n = snprintf(header, sizeof header, "PUT %s %lld\n", name, size);
+    double start = now_sec();
+    if (send_all(c->fd, header, (size_t)n) < 0) { close(fd); return -1; }
+
+    char chunk[CHUNK];
+    long long left = size;
+    while (left > 0) {
+        ssize_t r = read(fd, chunk, left < CHUNK ? (size_t)left : CHUNK);
+        if (r <= 0) {
+            printf("!! read error on local file, connection must be closed\n");
+            close(fd);
+            return -1;
+        }
+        if (send_all(c->fd, chunk, (size_t)r) < 0) { close(fd); return -1; }
+        left -= r;
+    }
+    close(fd);
+
+    if (read_line(c, reply, reply_size) != 1) return -1;
+    double secs = now_sec() - start;
+    print_response(reply);
+    if (strncmp(reply, "OK FILE_RECEIVED", 16) == 0)
+        show_rate("uploaded", size, secs);
+    return 0;
+}
+
+static int do_get(conn_t *c, const char *name, char *reply, size_t reply_size)
+{
+    char line[600];
+    int n = snprintf(line, sizeof line, "GET %s\n", name);
+    double start = now_sec();
+    if (send_all(c->fd, line, (size_t)n) < 0) return -1;
+    if (read_line(c, reply, reply_size) != 1) return -1;
+
+    char rname[256];
+    long long size;
+    if (sscanf(reply, "OK FILE_SEND %255s %lld", rname, &size) != 2 || size < 0) {
+        print_response(reply);
+        return 0;
+    }
+    print_response(reply);
+
+    char name_copy[256], out_path[512];
+    snprintf(name_copy, sizeof name_copy, "%s", name);
+    mkdir(DOWNLOAD_DIR, 0755);
+    snprintf(out_path, sizeof out_path, "%s/%s", DOWNLOAD_DIR, basename(name_copy));
+
+    int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) printf("!! cannot create %s, data will be discarded\n", out_path);
+
+    char chunk[CHUNK];
+    long long left = size;
+    while (left > 0) {
+        ssize_t r = read_bytes(c, chunk, left < CHUNK ? (size_t)left : CHUNK);
+        if (r <= 0) {
+            printf("!! connection lost after %lld of %lld bytes\n", size - left, size);
+            if (fd >= 0) { close(fd); unlink(out_path); }
+            return -1;
+        }
+        if (fd >= 0 && write(fd, chunk, (size_t)r) != r) {
+            printf("!! write error, removing partial file\n");
+            close(fd);
+            unlink(out_path);
+            fd = -1;
+        }
+        left -= r;
+    }
+    if (fd >= 0) {
+        close(fd);
+        printf("   saved to %s\n", out_path);
+        show_rate("downloaded", size, now_sec() - start);
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
@@ -173,7 +305,8 @@ int main(int argc, char *argv[])
     if (c->fd < 0) { free(c); return 1; }
 
     printf("Connected to RemoteOps Agent at %s:%d\n", host, port);
-    printf("Commands: AUTH <token> | SYSINFO | LISTPROC | EXEC <name> | QUIT\n");
+    printf("Commands: AUTH <token> | SYSINFO | LISTPROC | EXEC <name> |\n"
+           "          PUT <local_file> | GET <name> | QUIT\n");
 
     char input[MAX_INPUT];
     static char reply[BUF_SIZE];
@@ -188,6 +321,15 @@ int main(int argc, char *argv[])
         }
         input[strcspn(input, "\r\n")] = '\0';
         if (input[0] == '\0') continue;
+
+        if (strncmp(input, "PUT ", 4) == 0 || strncmp(input, "GET ", 4) == 0) {
+            char *arg = input + 4;
+            while (*arg == ' ') arg++;
+            int rc = input[0] == 'P' ? do_put(c, arg, reply, sizeof reply)
+                                     : do_get(c, arg, reply, sizeof reply);
+            if (rc < 0) { printf("Connection lost.\n"); break; }
+            continue;
+        }
 
         char out[MAX_INPUT + 2];
         int n = snprintf(out, sizeof out, "%s\n", input);
