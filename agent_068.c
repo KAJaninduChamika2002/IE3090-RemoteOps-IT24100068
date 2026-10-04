@@ -11,11 +11,13 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #define REG_NO       "IT24100068"
@@ -31,6 +33,8 @@
 #define MAX_LINE     1024
 #define MAX_RESP     32768
 #define LOG_PREVIEW  200
+#define MAX_FILE_SIZE (10L * 1024 * 1024)
+#define CHUNK        65536
 
 typedef struct {
     int    fd;
@@ -285,7 +289,192 @@ static void cmd_exec(session_t *s, const char *name, const char *extra)
     send_response(s, "ERR 002 COMMAND_NOT_ALLOWED");
 }
 
-/* returns 1 when the connection should close */
+static double now_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* takes leftover bytes from the line buffer first, then reads the socket */
+static ssize_t read_bytes(session_t *s, char *dst, size_t want)
+{
+    if (s->buf_len > 0) {
+        size_t n = s->buf_len < want ? s->buf_len : want;
+        memcpy(dst, s->buf, n);
+        memmove(s->buf, s->buf + n, s->buf_len - n);
+        s->buf_len -= n;
+        return (ssize_t)n;
+    }
+    for (;;) {
+        ssize_t n = recv(s->fd, dst, want, 0);
+        if (n < 0 && errno == EINTR) continue;
+        return n;
+    }
+}
+
+static int discard_bytes(session_t *s, long long left)
+{
+    char tmp[CHUNK];
+    while (left > 0) {
+        ssize_t n = read_bytes(s, tmp, left < CHUNK ? (size_t)left : CHUNK);
+        if (n <= 0) return -1;
+        left -= n;
+    }
+    return 0;
+}
+
+static int write_all(int fd, const char *data, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = write(fd, data, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        data += n;
+        len  -= (size_t)n;
+    }
+    return 0;
+}
+
+/* no paths, no hidden files - keeps everything inside STORAGE_DIR */
+static int valid_filename(const char *name)
+{
+    size_t len = strlen(name);
+    if (len == 0 || len > 200) return 0;
+    if (name[0] == '.') return 0;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\' || *p < 33 || *p > 126) return 0;
+    return 1;
+}
+
+static int parse_size(const char *str, long long *out)
+{
+    char *end;
+    errno = 0;
+    long long v = strtoll(str, &end, 10);
+    if (errno || *end != '\0' || end == str || v < 0) return 0;
+    *out = v;
+    return 1;
+}
+
+/* returns -1 if the connection was lost during the transfer */
+static int cmd_put(session_t *s, const char *name, const char *size_str, const char *extra)
+{
+    long long size;
+    if (!name || !size_str || extra || !parse_size(size_str, &size)) {
+        send_response(s, "ERR 006 BAD_SYNTAX");
+        return 0;
+    }
+
+    int bad_name = !valid_filename(name);
+    if (bad_name || size > MAX_FILE_SIZE) {
+        log_event("PUT rejected '%s' (%lld bytes) from %s:%d - %s", name, size,
+                  s->ip, s->port, bad_name ? "invalid filename" : "too large");
+        if (discard_bytes(s, size) < 0) return -1;
+        if (bad_name) send_response(s, "ERR 010 INVALID_FILENAME");
+        else          send_response(s, "ERR 004 FILE_TOO_LARGE");
+        return 0;
+    }
+
+    char tmp_path[512], final_path[512];
+    snprintf(tmp_path, sizeof tmp_path, "%s/.upload_XXXXXX", STORAGE_DIR);
+    snprintf(final_path, sizeof final_path, "%s/%s", STORAGE_DIR, name);
+
+    int fd = mkstemp(tmp_path);
+    if (fd >= 0) fchmod(fd, 0644);
+    if (fd < 0) {
+        log_event("PUT '%s' cannot create temp file: %s", name, strerror(errno));
+        if (discard_bytes(s, size) < 0) return -1;
+        send_response(s, "ERR 011 STORAGE_ERROR");
+        return 0;
+    }
+
+    double start = now_sec();
+    char chunk[CHUNK];
+    long long left = size;
+    int write_failed = 0;
+
+    while (left > 0) {
+        ssize_t n = read_bytes(s, chunk, left < CHUNK ? (size_t)left : CHUNK);
+        if (n <= 0) {
+            close(fd);
+            unlink(tmp_path);
+            log_event("PUT '%s' aborted after %lld of %lld bytes (client lost)",
+                      name, size - left, size);
+            return -1;
+        }
+        if (!write_failed && write_all(fd, chunk, (size_t)n) < 0)
+            write_failed = 1;
+        left -= n;
+    }
+    close(fd);
+
+    if (write_failed || rename(tmp_path, final_path) < 0) {
+        unlink(tmp_path);
+        log_event("PUT '%s' failed to save: %s", name, strerror(errno));
+        send_response(s, "ERR 011 STORAGE_ERROR");
+        return 0;
+    }
+
+    double secs = now_sec() - start;
+    log_event("PUT '%s' %lld bytes from %s:%d in %.3f s (%.0f bytes/s)", name, size,
+              s->ip, s->port, secs, secs > 0 ? size / secs : 0.0);
+    send_response(s, "OK FILE_RECEIVED %s", name);
+    return 0;
+}
+
+static int cmd_get(session_t *s, const char *name, const char *extra)
+{
+    if (!name || extra) {
+        send_response(s, "ERR 006 BAD_SYNTAX");
+        return 0;
+    }
+    if (!valid_filename(name)) {
+        send_response(s, "ERR 010 INVALID_FILENAME");
+        return 0;
+    }
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", STORAGE_DIR, name);
+
+    int fd = open(path, O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        if (fd >= 0) close(fd);
+        log_event("GET '%s' not found for %s:%d", name, s->ip, s->port);
+        send_response(s, "ERR 005 FILE_NOT_FOUND");
+        return 0;
+    }
+
+    long long size = st.st_size;
+    if (send_response(s, "OK FILE_SEND %s %lld", name, size) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    double start = now_sec();
+    char chunk[CHUNK];
+    long long left = size;
+    while (left > 0) {
+        ssize_t n = read(fd, chunk, left < CHUNK ? (size_t)left : CHUNK);
+        if (n <= 0 || send_all(s->fd, chunk, (size_t)n) < 0) {
+            close(fd);
+            log_event("GET '%s' aborted after %lld of %lld bytes", name, size - left, size);
+            return -1;
+        }
+        left -= n;
+    }
+    close(fd);
+
+    double secs = now_sec() - start;
+    log_event("GET '%s' %lld bytes to %s:%d in %.3f s (%.0f bytes/s)", name, size,
+              s->ip, s->port, secs, secs > 0 ? size / secs : 0.0);
+    return 0;
+}
+
+/* returns 1 = QUIT, -1 = connection lost, 0 = carry on */
 static int handle_command(session_t *s, char *line)
 {
     log_event("RX %s:%d <- %s", s->ip, s->port,
@@ -327,6 +516,15 @@ static int handle_command(session_t *s, char *line)
         char *name  = strtok_r(NULL, " ", &save);
         char *extra = strtok_r(NULL, " ", &save);
         cmd_exec(s, name, extra);
+    } else if (strcmp(cmd, "PUT") == 0) {
+        char *name  = strtok_r(NULL, " ", &save);
+        char *size  = strtok_r(NULL, " ", &save);
+        char *extra = strtok_r(NULL, " ", &save);
+        return cmd_put(s, name, size, extra);
+    } else if (strcmp(cmd, "GET") == 0) {
+        char *name  = strtok_r(NULL, " ", &save);
+        char *extra = strtok_r(NULL, " ", &save);
+        return cmd_get(s, name, extra);
     } else if (strcmp(cmd, "QUIT") == 0) {
         send_response(s, "OK BYE");
         return 1;
@@ -348,6 +546,10 @@ static void *client_thread(void *arg)
         int r = read_line(s, line, sizeof line);
         if (r == 1) {
             quit = handle_command(s, line);
+            if (quit < 0) {
+                log_event("DISCONNECT %s:%d (ungraceful: lost during transfer)", s->ip, s->port);
+                break;
+            }
         } else if (r == -2) {
             send_response(s, "ERR 009 LINE_TOO_LONG");
         } else {
@@ -357,7 +559,7 @@ static void *client_thread(void *arg)
         }
     }
 
-    if (quit)
+    if (quit > 0)
         log_event("DISCONNECT %s:%d (QUIT)", s->ip, s->port);
 
     close(s->fd);
@@ -398,6 +600,8 @@ int main(void)
             perror("accept");
             continue;
         }
+
+        setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof yes);
 
         session_t *s = calloc(1, sizeof *s);
         if (!s) { close(cfd); continue; }
