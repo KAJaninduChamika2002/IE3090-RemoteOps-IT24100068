@@ -67,10 +67,10 @@ The Controller only sends a name; the command string is fixed in the Agent, so u
 - [x] AUTH gate, QUIT, SID tag on every response
 - [x] Timestamped, thread-safe logging; ungraceful disconnect handling
 - [x] SYSINFO (/proc), LISTPROC (ps), EXEC (fixed whitelist)
-- [ ] PUT / GET
+- [x] PUT / GET (exact byte count, 10 MB limit, temp file + rename)
 - [ ] MONITOR START / STOP (UDP)
 - [x] Controller (interactive, same framing, SID check)
-- [ ] Optional extension: transfer throughput
+- [x] Optional extension: transfer throughput (bytes/s)
 
 ## Error codes
 
@@ -85,3 +85,5 @@ The Controller only sends a name; the command string is fixed in the Agent, so u
 | 007 | ALREADY_AUTHENTICATED |
 | 008 | UNKNOWN_COMMAND |
 | 009 | LINE_TOO_LONG |
+| 010 | INVALID_FILENAME |
+| 011 | STORAGE_ERROR |

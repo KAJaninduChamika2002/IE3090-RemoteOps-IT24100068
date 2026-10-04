@@ -34,3 +34,20 @@
 
 ## Next
 - Day 3: PUT / GET with exact byte counts, md5sum check, throughput extension.
+
+## Sun 4 Oct 2026 — Day 3
+**Done:** PUT and GET in Agent and Controller, plus throughput extension.
+
+**Decisions**
+- PUT reads exactly <filesize> bytes. Bytes that arrived in the same recv() as the PUT line are already in the session buffer, so read_bytes() uses them first before calling recv().
+- Upload goes to a temp file (mkstemp) and is renamed only when complete, so a client that disconnects mid-upload never leaves a half file.
+- Max file size 10 MB (my assumption). Too large → bytes are read and discarded, then ERR 004. Otherwise those bytes would be read as commands.
+- Filename must have no '/', no '\', not start with '.', printable chars only → stops ../ path traversal. Added ERR 010 INVALID_FILENAME and ERR 011 STORAGE_ERROR.
+- GET sends "OK FILE_SEND <name> <size>" then streams in 64 KB chunks. Controller saves to ./downloads/ so the original isn't overwritten.
+- Throughput (extension): clock_gettime(CLOCK_MONOTONIC); Controller prints bytes/s, Agent logs it. 5 MB: ~64 MB/s up, ~55 MB/s down on localhost.
+- Small files took ~40 ms because of Nagle's algorithm + delayed ACK; set TCP_NODELAY on both sockets.
+
+**Tested:** 39 B text, 5 MB binary, 11 MB (ERR 004), missing file (ERR 005), ../ name (ERR 010), SYSINFO after errors still works. md5sum identical for both transfers.
+
+## Next
+- Day 4: MONITOR START/STOP over UDP, disconnect tests, 5+ clients.
