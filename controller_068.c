@@ -10,6 +10,7 @@
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <time.h>
@@ -30,6 +31,9 @@
 #define SHOW_PROCS   30
 #define CHUNK        65536
 #define DOWNLOAD_DIR "downloads"
+
+static int udp_fd = -1;
+static int udp_port = 0;
 
 typedef struct {
     int    fd;
@@ -291,6 +295,72 @@ static int do_get(conn_t *c, const char *name, char *reply, size_t reply_size)
     return 0;
 }
 
+static void *udp_listener(void *arg)
+{
+    (void)arg;
+    char msg[512];
+    long count = 0;
+    for (;;) {
+        struct sockaddr_in from;
+        socklen_t flen = sizeof from;
+        ssize_t n = recvfrom(udp_fd, msg, sizeof msg - 1, 0, (struct sockaddr *)&from, &flen);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        msg[n] = '\0';
+        count++;
+
+        char ts[16];
+        time_t now = time(NULL);
+        struct tm tmv;
+        localtime_r(&now, &tmv);
+        strftime(ts, sizeof ts, "%H:%M:%S", &tmv);
+
+        printf("\n[UDP #%ld %s from %s] %s%s\nremoteops> ", count, ts,
+               inet_ntoa(from.sin_addr), msg,
+               strstr(msg, SID_TAG) ? "" : "  !! missing SID tag");
+        fflush(stdout);
+    }
+    return NULL;
+}
+
+/* binds the UDP port once and starts the background listener */
+static int open_udp(int port)
+{
+    if (udp_fd >= 0) {
+        if (port == udp_port) return 0;
+        printf("!! already listening on UDP %d, use that port\n", udp_port);
+        return -1;
+    }
+
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) { perror("udp socket"); return -1; }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port        = htons(port);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
+        perror("udp bind");
+        close(fd);
+        return -1;
+    }
+
+    udp_fd = fd;
+    udp_port = port;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, udp_listener, NULL) != 0) {
+        close(fd);
+        udp_fd = -1;
+        return -1;
+    }
+    pthread_detach(tid);
+    printf("   listening for monitor datagrams on UDP %d\n", port);
+    return 0;
+}
+
 int main(int argc, char *argv[])
 {
     const char *host = argc > 1 ? argv[1] : "127.0.0.1";
@@ -306,7 +376,8 @@ int main(int argc, char *argv[])
 
     printf("Connected to RemoteOps Agent at %s:%d\n", host, port);
     printf("Commands: AUTH <token> | SYSINFO | LISTPROC | EXEC <name> |\n"
-           "          PUT <local_file> | GET <name> | QUIT\n");
+           "          PUT <local_file> | GET <name> | MONITOR START <udp_port> |\n"
+           "          MONITOR STOP | QUIT\n");
 
     char input[MAX_INPUT];
     static char reply[BUF_SIZE];
@@ -330,6 +401,12 @@ int main(int argc, char *argv[])
             if (rc < 0) { printf("Connection lost.\n"); break; }
             continue;
         }
+
+        int mport;
+        char tail;
+        if (sscanf(input, "MONITOR START %d %c", &mport, &tail) == 1 &&
+            mport > 0 && mport < 65536 && open_udp(mport) < 0)
+            continue;
 
         char out[MAX_INPUT + 2];
         int n = snprintf(out, sizeof out, "%s\n", input);
