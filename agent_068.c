@@ -35,6 +35,7 @@
 #define LOG_PREVIEW  200
 #define MAX_FILE_SIZE (10L * 1024 * 1024)
 #define CHUNK        65536
+#define MONITOR_INTERVAL 5
 
 typedef struct {
     int    fd;
@@ -43,6 +44,12 @@ typedef struct {
     int    authenticated;
     char   buf[BUF_SIZE];
     size_t buf_len;
+
+    pthread_t       mon_thread;
+    pthread_mutex_t mon_lock;
+    pthread_cond_t  mon_cond;
+    int             mon_running;
+    int             mon_port;
 } session_t;
 
 /* client only picks a name, the actual command is fixed here */
@@ -474,6 +481,104 @@ static int cmd_get(session_t *s, const char *name, const char *extra)
     return 0;
 }
 
+/* sends a SYSINFO datagram every MONITOR_INTERVAL seconds until stopped */
+static void *monitor_thread(void *arg)
+{
+    session_t *s = arg;
+    int ufd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ufd < 0) {
+        log_event("MONITOR %s:%d cannot create UDP socket: %s", s->ip, s->port, strerror(errno));
+        return NULL;
+    }
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof dest);
+    dest.sin_family = AF_INET;
+    dest.sin_port   = htons(s->mon_port);
+    inet_pton(AF_INET, s->ip, &dest.sin_addr);
+
+    long sent = 0;
+    pthread_mutex_lock(&s->mon_lock);
+    while (s->mon_running) {
+        double load;
+        long mem_mb, up;
+        get_sysinfo(&load, &mem_mb, &up);
+
+        char msg[128];
+        int len = snprintf(msg, sizeof msg, "SYSINFO %.2f %ld %ld %s", load, mem_mb, up, SID_TAG);
+        sendto(ufd, msg, (size_t)len, 0, (struct sockaddr *)&dest, sizeof dest);
+        sent++;
+
+        struct timespec wake;
+        clock_gettime(CLOCK_REALTIME, &wake);
+        wake.tv_sec += MONITOR_INTERVAL;
+        while (s->mon_running &&
+               pthread_cond_timedwait(&s->mon_cond, &s->mon_lock, &wake) != ETIMEDOUT)
+            ;
+    }
+    pthread_mutex_unlock(&s->mon_lock);
+
+    close(ufd);
+    log_event("MONITOR %s:%d -> UDP %d stopped after %ld datagrams", s->ip, s->port, s->mon_port, sent);
+    return NULL;
+}
+
+static int start_monitor(session_t *s, int udp_port)
+{
+    pthread_mutex_lock(&s->mon_lock);
+    s->mon_running = 1;
+    s->mon_port = udp_port;
+    pthread_mutex_unlock(&s->mon_lock);
+
+    if (pthread_create(&s->mon_thread, NULL, monitor_thread, s) != 0) {
+        s->mon_running = 0;
+        return -1;
+    }
+    return 0;
+}
+
+static void stop_monitor(session_t *s)
+{
+    pthread_mutex_lock(&s->mon_lock);
+    int was_running = s->mon_running;
+    s->mon_running = 0;
+    pthread_cond_signal(&s->mon_cond);
+    pthread_mutex_unlock(&s->mon_lock);
+
+    if (was_running)
+        pthread_join(s->mon_thread, NULL);
+}
+
+static void cmd_monitor(session_t *s, const char *action, const char *port_str, const char *extra)
+{
+    if (action && strcmp(action, "START") == 0 && port_str && !extra) {
+        long long port;
+        if (!parse_size(port_str, &port) || port < 1 || port > 65535) {
+            send_response(s, "ERR 006 BAD_SYNTAX");
+            return;
+        }
+        if (s->mon_running) {
+            send_response(s, "ERR 012 ALREADY_MONITORING");
+            return;
+        }
+        if (start_monitor(s, (int)port) < 0) {
+            send_response(s, "ERR 014 MONITOR_FAILED");
+            return;
+        }
+        log_event("MONITOR %s:%d -> UDP %s:%lld every %d s", s->ip, s->port, s->ip, port, MONITOR_INTERVAL);
+        send_response(s, "OK MONITOR_STARTED");
+    } else if (action && strcmp(action, "STOP") == 0 && !port_str) {
+        if (!s->mon_running) {
+            send_response(s, "ERR 013 NOT_MONITORING");
+            return;
+        }
+        stop_monitor(s);
+        send_response(s, "OK MONITOR_STOPPED");
+    } else {
+        send_response(s, "ERR 006 BAD_SYNTAX");
+    }
+}
+
 /* returns 1 = QUIT, -1 = connection lost, 0 = carry on */
 static int handle_command(session_t *s, char *line)
 {
@@ -525,7 +630,13 @@ static int handle_command(session_t *s, char *line)
         char *name  = strtok_r(NULL, " ", &save);
         char *extra = strtok_r(NULL, " ", &save);
         return cmd_get(s, name, extra);
+    } else if (strcmp(cmd, "MONITOR") == 0) {
+        char *action = strtok_r(NULL, " ", &save);
+        char *port   = strtok_r(NULL, " ", &save);
+        char *extra  = strtok_r(NULL, " ", &save);
+        cmd_monitor(s, action, port, extra);
     } else if (strcmp(cmd, "QUIT") == 0) {
+        stop_monitor(s);
         send_response(s, "OK BYE");
         return 1;
     } else {
@@ -562,7 +673,10 @@ static void *client_thread(void *arg)
     if (quit > 0)
         log_event("DISCONNECT %s:%d (QUIT)", s->ip, s->port);
 
+    stop_monitor(s);
     close(s->fd);
+    pthread_mutex_destroy(&s->mon_lock);
+    pthread_cond_destroy(&s->mon_cond);
     free(s);
     return NULL;
 }
@@ -608,6 +722,8 @@ int main(void)
         s->fd = cfd;
         inet_ntop(AF_INET, &caddr.sin_addr, s->ip, sizeof s->ip);
         s->port = ntohs(caddr.sin_port);
+        pthread_mutex_init(&s->mon_lock, NULL);
+        pthread_cond_init(&s->mon_cond, NULL);
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, s) != 0) {
