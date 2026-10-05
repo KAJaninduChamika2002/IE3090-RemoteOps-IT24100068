@@ -1,5 +1,4 @@
 # RemoteOps — Remote System Monitoring & Management Tool (IE3090)
-
 **Student registration number:** IT24100068
 
 ## Personalised values
@@ -87,3 +86,7 @@ The Controller only sends a name; the command string is fixed in the Agent, so u
 | 009 | LINE_TOO_LONG |
 | 010 | INVALID_FILENAME |
 | 011 | STORAGE_ERROR |
+| 012 | ALREADY_MONITORING |
+| 013 | NOT_MONITORING |
+| 014 | MONITOR_FAILED |
+

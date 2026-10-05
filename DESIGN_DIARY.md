@@ -51,3 +51,21 @@
 
 ## Next
 - Day 4: MONITOR START/STOP over UDP, disconnect tests, 5+ clients.
+
+## Mon 5 Oct 2026 — Day 4
+**Done:** MONITOR START/STOP over UDP; tested concurrency and disconnects.
+
+**Decisions**
+- One monitor thread per session, sending "SYSINFO <load> <mem> <uptime> SID:8600" to the client's TCP IP on the requested UDP port. Interval: 5 seconds.
+- Thread waits with pthread_cond_timedwait instead of sleep(5), so MONITOR STOP signals the condition and the thread exits immediately.
+- stop_monitor() is called on MONITOR STOP, QUIT and in client_thread cleanup, so a crashed client never leaves a stream running.
+- Reuses get_sysinfo() from Day 2.
+- Errors: 012 ALREADY_MONITORING, 013 NOT_MONITORING, 014 MONITOR_FAILED; bad port gives 006.
+- Controller binds the UDP port before sending MONITOR START and prints datagrams from a background thread with a counter and timestamp, so commands can still be typed while monitoring.
+- Observed: first UDP datagram can arrive before the TCP "OK MONITOR_STARTED" reply, because they are separate channels. Harmless.
+
+**Tested:** datagrams exactly 5 s apart; SYSINFO over TCP works during monitoring; none after STOP or QUIT; kill -9 of controller -> agent logged "ungraceful: peer closed" and "stopped after 5 datagrams" in the same second, then served a new client; 5 controllers at once (ss shows 5 ESTABLISHED, log shows interleaved lines from 5 threads).
+
+## Next
+- Tue 6 Oct: code screenshots, implementation report, reflection.
+- Wed 7 Oct: ZIP, make repo visible to examiner, submit early.
